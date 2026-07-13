@@ -1,7 +1,7 @@
 """Aligned three-day LightGBM features and conformal scale features.
 
-The functions preserve the unit of ``values``. The main experiment passes raw
-IOPS/bandwidth, so current, lag, rolling, seasonal features and targets are raw.
+The functions preserve the unit of ``values``. The experiment passes raw
+bandwidth, so current, lag, rolling, seasonal features and targets are raw.
 """
 from __future__ import annotations
 

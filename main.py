@@ -16,7 +16,6 @@ import torch
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from config.experiment import load_config
 from conformal import SplitConformal
 from data_loader import load_workload
 from error_scale import ErrorScaleModel
@@ -35,6 +34,49 @@ from window_dataset import WorkloadWindowDataset, window_indices
 
 BASELINES = ("persistence", "seasonal_persistence", "rolling_mean")
 logger = logging.getLogger("workload_experiment")
+
+# Single standalone bandwidth experiment configuration. There is no metric
+# switching layer because this repository intentionally supports bandwidth only.
+CONFIG = {
+    "data": {
+        "trace_path": "/data/tidal_info/cluster_trace_db/all_aligned_trace.pkl",
+        "points_per_day": 288, "total_days": 7, "min_scale": 1.0,
+        "max_disks": None,
+    },
+    "sampling": {
+        "lstm_train_stride": 6, "lightgbm_train_stride": 1,
+        "eval_stride": 1, "lstm_max_train_windows": 2_000_000,
+        "random_seed": 42,
+    },
+    "compute": {
+        "feature_workers": 16, "feature_chunk_disks": 256,
+        "scheduling_workers": 16, "lstm_dataloader_workers": 8,
+    },
+    "lightgbm": {
+        "n_estimators": 400, "learning_rate": 0.05, "num_leaves": 31,
+        "max_depth": -1, "n_jobs": 32,
+    },
+    "lstm": {
+        "hidden_size": 64, "num_layers": 1, "dropout": 0.0,
+        "batch_size": 256, "epochs": 20, "learning_rate": 0.001,
+        "patience": 3, "pin_memory": True,
+    },
+    "conformal": {
+        "alpha": 0.1,
+        "error_scale": {
+            "a_min": 1.0, "train_stride": 6, "n_estimators": 200,
+            "learning_rate": 0.05, "num_leaves": 31,
+            "max_depth": -1, "n_jobs": 32,
+        },
+    },
+    "scheduling": {
+        "node_number": 100, "risk_lambda": 0.25,
+        "capacity_ratio": 1.2,
+        "capacity_candidates": [1.1, 1.2, 1.3, 1.4, 1.5],
+        "risk_lambda_candidates": [0.0, 0.25, 0.5, 0.75, 1.0],
+    },
+    "output_root": "results",
+}
 
 
 def stage(number, total, message):
@@ -110,8 +152,7 @@ def predict_fitted(name, model, model_values, raw, eval_decisions, device,
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=str(ROOT / "configs/bandwidth.yaml"))
-    parser.add_argument("--data", help="Aligned .pkl, long CSV, or matrix .npz; overrides config")
+    parser.add_argument("--data", help="Aligned .pkl, long CSV, or matrix .npz")
     parser.add_argument("--device", default="cuda:0", help="Defaults to cuda:0; cpu is also supported")
     parser.add_argument("--log-level", default="INFO",
                         choices=("DEBUG", "INFO", "WARNING", "ERROR"))
@@ -119,19 +160,19 @@ def main():
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     started_at = time.monotonic()
-    stage(1, 8, "读取并校验实验配置")
-    cfg = load_config(args.config)
+    stage(1, 8, "初始化 bandwidth 实验配置")
+    cfg = CONFIG
     path = args.data or cfg["data"]["trace_path"]
     if not path:
-        raise SystemExit("Set data.trace_path or pass --data")
+        raise SystemExit("Set CONFIG['data']['trace_path'] or pass --data")
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise SystemExit(f"GPU {device} requested but CUDA is unavailable")
     p = cfg["data"]["points_per_day"]
-    stage(2, 8, f"加载 {cfg['target_metric']} 负载数据（设备：{device}）")
-    disk_ids, raw = load_workload(path, cfg["target_metric"], p * cfg["data"]["total_days"], cfg["data"]["max_disks"])
+    stage(2, 8, f"加载 bandwidth 负载数据（设备：{device}）")
+    disk_ids, raw = load_workload(path, p * cfg["data"]["total_days"], cfg["data"]["max_disks"])
     logger.info("数据加载完成：%d 块云盘，每块 %d 个时间点", len(disk_ids), raw.shape[1])
-    splits = seven_day_splits(p); out = ROOT / cfg["output"]["root"] / cfg["target_metric"]
+    splits = seven_day_splits(p); out = ROOT / cfg["output_root"] / "bandwidth"
     out.mkdir(parents=True, exist_ok=True)
 
     # LightGBM uses raw units. Global LSTM uses leakage-safe per-disk Q95 scaling.
@@ -154,7 +195,7 @@ def main():
                                       output_scaler=method_scaler)
         internal_models[method] = trained
         val_predictions[method] = pred
-        rows.append({"target_metric": cfg["target_metric"], "model": method,
+        rows.append({"workload": "bandwidth", "model": method,
                      **point_metrics(val_y, pred, disk_ids[val_d], peak4)})
         logger.info("方法 %s 完成，验证 WAPE=%.6f", method, rows[-1]["WAPE"])
     forecast_table = pd.DataFrame(rows).sort_values("WAPE")
@@ -236,7 +277,7 @@ def main():
         lower, upper = calibrator.interval(test_predictions[predictor], test_scale)
         adaptive_intervals[predictor] = (lower, upper)
         interval_rows.append({
-            "target_metric": cfg["target_metric"], "predictor": predictor,
+            "workload": "bandwidth", "predictor": predictor,
             "method": "learned_error_scale", "q": calibrator.q,
             "mean_cal_scale": float(np.mean(cal_scale)),
             "mean_test_scale": float(np.mean(test_scale)),
@@ -309,7 +350,7 @@ def main():
     metadata = {"validation_best_model": selected,
                 "downstream_predictors": list(downstream),
                 "scheduling_strategies": list(loads),
-                "metric": cfg["target_metric"], "disk_count": len(disk_ids),
+                "workload": "bandwidth", "disk_count": len(disk_ids),
                 "validation_decisions": len(list(val_decisions)), "calibration_decisions": len(list(cal_decisions)),
                 "test_decisions": len(list(test_decisions)), "capacity_ratio": rho,
                 "capacity_sensitivity": scheduling_cfg["capacity_candidates"],
